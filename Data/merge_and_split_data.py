@@ -37,6 +37,8 @@ def load_and_pivot_stations(station_csv_path: str) -> pd.DataFrame:
         c for c in df.columns if "valid" in c or "date" in c or "time" in c
     ][0]
     df["valid_edt"] = pd.to_datetime(df[time_col])
+    # Enforce the as-of boundary here as well as in the source downloader.
+    df = df[df["valid_edt"] < CUTOFF_EDT].copy()
 
     # Identify station column ('station', 'station_id', or 'station_code')
     stn_col = [
@@ -74,16 +76,65 @@ def load_and_preprocess_master() -> pd.DataFrame:
     gfs_df = pd.read_csv(GFS_PATH)
     solar_df = pd.read_csv(SOLAR_PATH)
 
-    # Align GFS using target forecast time 'valid'
-    if "valid" in gfs_df.columns:
-        gfs_df["valid_edt"] = pd.to_datetime(gfs_df["valid"])
+    # The saved valid_edt is already local time and is required for interpolated rows.
+    if "valid_edt" not in gfs_df.columns:
+        if "valid" not in gfs_df.columns:
+            raise ValueError("GFS input must contain valid_edt or valid timestamps.")
+        # Raw GFS valid timestamps are UTC-naive.
+        gfs_df["valid_edt"] = (
+            pd.to_datetime(gfs_df["valid"], utc=True)
+            .dt.tz_convert("America/New_York")
+            .dt.tz_localize(None)
+        )
     else:
         gfs_df["valid_edt"] = pd.to_datetime(gfs_df["valid_edt"])
+
+    if "valid" in gfs_df.columns:
+        valid_utc = pd.to_datetime(
+            gfs_df["valid"], errors="coerce", utc=True, format="mixed"
+        )
+        expected_valid_edt = (
+            valid_utc.dt.tz_convert("America/New_York").dt.tz_localize(None)
+        )
+        mismatched_valid = (
+            gfs_df["valid_edt"].notna()
+            & expected_valid_edt.notna()
+            & gfs_df["valid_edt"].ne(expected_valid_edt)
+        )
+        if mismatched_valid.any():
+            raise ValueError(
+                "GFS valid_edt does not match valid converted from UTC to Eastern time."
+            )
+
+    if "init_valid" not in gfs_df.columns:
+        raise ValueError("GFS input must include init_valid to verify the data cutoff.")
+    init_utc = pd.to_datetime(
+        gfs_df["init_valid"], errors="coerce", utc=True, format="mixed"
+    )
+    unparseable_init = gfs_df["init_valid"].notna() & init_utc.isna()
+    if unparseable_init.any():
+        raise ValueError("GFS input contains unparseable init_valid timestamps.")
+    init_edt = init_utc.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    post_cutoff_init = init_edt.notna() & (init_edt >= CUTOFF_EDT)
+    if post_cutoff_init.any():
+        print(
+            f"Discarding {int(post_cutoff_init.sum())} GFS rows initialized at or "
+            "after the cutoff."
+        )
+        gfs_df = gfs_df.loc[~post_cutoff_init].copy()
+
+    # Keep the latest eligible forecast cycle for each valid hour.
+    gfs_df["_init_sort"] = pd.to_datetime(
+        gfs_df["init_valid"], errors="coerce", utc=True, format="mixed"
+    )
 
     solar_df["valid_edt"] = pd.to_datetime(solar_df["valid_edt"])
 
     # Remove duplicates on valid_edt if present
-    gfs_df = gfs_df.sort_values("valid_edt").drop_duplicates("valid_edt")
+    gfs_df = gfs_df.sort_values(
+        ["valid_edt", "_init_sort"], na_position="first", kind="stable"
+    ).drop_duplicates("valid_edt", keep="last")
+    gfs_df = gfs_df.drop(columns=["_init_sort"], errors="ignore")
     solar_df = solar_df.sort_values("valid_edt").drop_duplicates("valid_edt")
     station_pivoted_df = station_pivoted_df.sort_values(
         "valid_edt"
@@ -104,12 +155,37 @@ def load_and_preprocess_master() -> pd.DataFrame:
     master_df = master_df.merge(gfs_df, on="valid_edt", how="left")
     master_df = master_df.merge(solar_df, on="valid_edt", how="left")
 
+    if (master_df["valid_edt"] >= CUTOFF_EDT).any():
+        future_observations = [
+            c
+            for c in master_df.columns
+            if any(c.startswith(f"{stn.lower()}_") for stn in STATION_MAP)
+            and not any(token in c for token in ("_lag_",))
+        ]
+        if master_df.loc[
+            master_df["valid_edt"] >= CUTOFF_EDT, future_observations
+        ].notna().any().any():
+            raise ValueError("Post-cutoff station observations remain after source filtering.")
+
     # Linearly interpolate 3-hour GFS gap nulls with slope
     gfs_cols = [c for c in master_df.columns if c.startswith("gfs_")]
     print(f"Interpolating GFS 3-hour gaps across {len(gfs_cols)} columns...")
     master_df[gfs_cols] = master_df[gfs_cols].interpolate(
-        method="linear", limit_direction="both"
+        method="linear", limit_area="inside"
     )
+
+    target_hours = master_df["valid_edt"].between(CUTOFF_EDT, INFERENCE_END_EDT)
+    missing_target_gfs = master_df.loc[
+        target_hours & master_df["gfs_tmpf"].isna(), "valid_edt"
+    ]
+    if not missing_target_gfs.empty:
+        missing_times = missing_target_gfs.dt.strftime("%Y-%m-%d %H:%M").tolist()
+        print(
+            f"WARNING: GFS temperature is missing for "
+            f"{len(missing_target_gfs)} inference hours; retaining those rows "
+            f"with null GFS features: {missing_times[:5]}"
+            + (" ..." if len(missing_times) > 5 else "")
+        )
 
     return master_df
 
@@ -175,12 +251,26 @@ def execute_3way_split():
         & (master_df["valid_edt"] <= INFERENCE_END_EDT)
     ].copy()
 
-    # Mask actual ground truth target columns in the inference set to prevent accidental leakage
+    if len(inference_df) != 336:
+        raise ValueError(f"Expected 336 inference hours, got {len(inference_df)}.")
+    if len(val_df) != 384:
+        raise ValueError(f"Expected 384 validation hours, got {len(val_df)}.")
+    if train_df["valid_edt"].ge(VAL_START_EDT).any():
+        raise ValueError("Training split includes rows at or after validation start.")
+    if val_df["valid_edt"].ge(CUTOFF_EDT).any():
+        raise ValueError("Validation split includes rows at or after the cutoff.")
+    if inference_df["valid_edt"].lt(CUTOFF_EDT).any():
+        raise ValueError("Inference split includes rows before the cutoff.")
+
+    # Mask current-time observations and observation-derived features; retain historical lags.
     obs_target_cols = [
         c
         for c in inference_df.columns
-        if any(c.startswith(f"{stn.lower()}_") for stn in STATION_MAP.keys())
-        and not any(x in c for x in ["_lag_", "grad_"])
+        if (
+            any(c.startswith(f"{stn.lower()}_") for stn in STATION_MAP)
+            and "_lag_" not in c
+        )
+        or c.startswith("grad_")
     ]
     obs_target_cols.append("gfs_temp_residual")
 
