@@ -6,3 +6,4 @@ cfgrib
 eccodes
 netcdf4
 tqdm
+pvlib
