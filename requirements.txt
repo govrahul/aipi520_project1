@@ -7,3 +7,5 @@ eccodes
 netcdf4
 tqdm
 pvlib
+ipykernel
+matplotlib
