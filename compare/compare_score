@@ -1,0 +1,65 @@
+# Compare the predictions with the real RDU temperatures for Sep 17 - Sep 30
+# Run from the project root, AFTER running the two model scripts:
+#   python compare_with_actual.py
+
+from io import StringIO
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import requests
+
+# 1. Download the real RDU observations (same source as the team's IEM loader)
+url = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+params = {
+    "station": "RDU", "data": "tmpf",
+    "year1": 2026, "month1": 9, "day1": 17,
+    "year2": 2026, "month2": 10, "day2": 1,
+    "tz": "America/New_York", "format": "onlycomma", "missing": "M",
+}
+response = requests.get(url, params=params)
+raw = pd.read_csv(StringIO(response.text), comment="#")
+
+# 2. Turn the raw readings into one average temperature per hour
+raw["valid"] = pd.to_datetime(raw["valid"])
+raw["tmpf"] = pd.to_numeric(raw["tmpf"], errors="coerce")
+actual = raw.set_index("valid")["tmpf"].resample("1h").mean().reset_index()
+actual.columns = ["valid_edt", "actual_tmpf"]
+
+# 3. Load the predictions from the two models
+lag14d = pd.read_csv("Data/linear_regression_lag14d_predictions.csv")
+recursive = pd.read_csv("Data/linear_regression_recursive_predictions.csv")
+lag14d["valid_edt"] = pd.to_datetime(lag14d["valid_edt"])
+recursive["valid_edt"] = pd.to_datetime(recursive["valid_edt"])
+
+# 4. Put everything in one table, matched by hour
+compare = lag14d.rename(columns={"predicted_tmpf": "lag14d_pred"})
+compare["recursive_pred"] = recursive["predicted_tmpf"]
+compare = compare.merge(actual, on="valid_edt", how="left")
+compare.to_csv("Data/comparison_sept17_sept30.csv", index=False)
+print(compare.head(10))
+
+# 5. Calculate the errors (only hours where a real temperature exists)
+scored = compare.dropna(subset=["actual_tmpf"])
+print("\nHours with real data:", len(scored), "out of", len(compare))
+for col in ["lag14d_pred", "recursive_pred"]:
+    error = scored[col] - scored["actual_tmpf"]
+    mae = error.abs().mean()
+    rmse = (error ** 2).mean() ** 0.5
+    print(col, "| MAE:", round(mae, 2), "F | RMSE:", round(rmse, 2), "F")
+
+# 6. Plot real vs predicted
+plt.figure(figsize=(12, 5))
+plt.plot(compare["valid_edt"], compare["actual_tmpf"],
+         label="Actual", color="#52514e", linewidth=2)
+plt.plot(compare["valid_edt"], compare["lag14d_pred"],
+         label="14-day lag model", color="#2a78d6", linewidth=1.5)
+plt.plot(compare["valid_edt"], compare["recursive_pred"],
+         label="Recursive model", color="#eb6834", linewidth=1.5)
+plt.title("RDU hourly temperature, Sep 17 - Sep 30: actual vs predicted")
+plt.xlabel("Date")
+plt.ylabel("Temperature (F)")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("comparison_plot.png", dpi=150)
+print("\nSaved: Data/comparison_sept17_sept30.csv and comparison_plot.png")
