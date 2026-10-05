@@ -9,3 +9,4 @@ tqdm
 pvlib
 ipykernel
 matplotlib
+scikit-learn
